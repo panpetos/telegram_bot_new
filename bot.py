@@ -41,6 +41,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("window_replacement_bot")
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=30)
+MAX_IMAGE_DIMENSION = 2048  # пиксели
+MAX_IMAGE_PAYLOAD = 7 * 1024 * 1024  # ~7 МБ
 LAST_IMAGE_URL: dict[int, str] = {}
 USER_SESSIONS: dict[int, dict] = {}
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
@@ -259,7 +261,64 @@ async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: st
             if "image/" not in ctype:
                 txt = await resp.text()
                 raise RuntimeError(f"Неожиданный content-type: {ctype} | тело: {txt[:400]}")
-            return await resp.read()
+        return await resp.read()
+
+
+def _resize_image_and_mask(
+    image: Image.Image,
+    mask: Image.Image,
+    scale: float,
+) -> tuple[Image.Image, Image.Image]:
+    """Вспомогательная функция для масштабирования изображения и маски."""
+
+    if scale >= 0.999:
+        return image, mask
+
+    new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+    resized_image = image.resize(new_size, Image.LANCZOS)
+    resized_mask = mask.resize(new_size, Image.NEAREST)
+    return resized_image, resized_mask
+
+
+def prepare_inpaint_payload(
+    image_path: str,
+    mask: Image.Image,
+    max_dimension: int = MAX_IMAGE_DIMENSION,
+    max_bytes: int = MAX_IMAGE_PAYLOAD,
+) -> tuple[bytes, bytes]:
+    """
+    Приводит изображение и маску к приемлемому размеру для Stability API.
+
+    API возвращает 413 при слишком больших payload'ах. Мы уменьшаем изображение и маску,
+    сохраняя пропорции, пока размер PNG не станет приемлемым.
+    """
+
+    with Image.open(image_path) as src:
+        image = src.convert("RGB")
+
+    mask = mask.convert("L")
+
+    # Ограничиваем максимальную сторону
+    longest_side = max(image.width, image.height)
+    if longest_side > max_dimension:
+        scale = max_dimension / float(longest_side)
+        image, mask = _resize_image_and_mask(image, mask, scale)
+
+    def encode(img: Image.Image, mk: Image.Image) -> tuple[bytes, bytes]:
+        img_buf = io.BytesIO()
+        img.save(img_buf, format="PNG", optimize=True)
+        mask_buf = io.BytesIO()
+        mk.save(mask_buf, format="PNG")
+        return img_buf.getvalue(), mask_buf.getvalue()
+
+    image_bytes, mask_bytes = encode(image, mask)
+
+    # Если все еще слишком большой payload, уменьшаем постепенно
+    while len(image_bytes) + len(mask_bytes) > max_bytes and min(image.width, image.height) > 512:
+        image, mask = _resize_image_and_mask(image, mask, 0.85)
+        image_bytes, mask_bytes = encode(image, mask)
+
+    return image_bytes, mask_bytes
 
 # ───────── перевод RU→EN ─────────
 async def translate_ru_to_en(text: str) -> tuple[str, str | None]:
@@ -455,15 +514,9 @@ async def handle_window_category(update: Update, context: ContextTypes.DEFAULT_T
     try:
         # Создаем маску для найденных окон
         mask = create_window_mask(session['image_path'], session['windows'])
-        
-        # Сохраняем маску
-        mask_buffer = io.BytesIO()
-        mask.save(mask_buffer, format='PNG')
-        mask_bytes = mask_buffer.getvalue()
-        
-        # Загружаем исходное изображение
-        with open(session['image_path'], 'rb') as f:
-            image_bytes = f.read()
+
+        # Готовим payload для Stability API (учитывая ограничения размера)
+        image_bytes, mask_bytes = prepare_inpaint_payload(session['image_path'], mask)
         
         # Переводим промпт
         prompt = category['prompt']
