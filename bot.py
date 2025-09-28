@@ -265,7 +265,7 @@ async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: st
             if "image/" not in ctype:
                 txt = await resp.text()
                 raise RuntimeError(f"Неожиданный content-type: {ctype} | тело: {txt[:400]}")
-        return await resp.read()
+            return await resp.read()
 
 
 def _resize_image_and_mask(
