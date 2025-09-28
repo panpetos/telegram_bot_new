@@ -557,5 +557,8 @@ def main():
     log.info("🚀 Бот для замены окон запущен")
     app.run_polling(allowed_updates=None, drop_pending_updates=False)
 
+    print("✅ Bot updated via GitHub Actions")
+
+
 if __name__ == "__main__":
     main()
