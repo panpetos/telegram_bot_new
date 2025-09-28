@@ -242,7 +242,7 @@ def create_window_mask(image_path: str, windows: List[Dict[str, Any]]) -> Image.
 
 async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: str) -> bytes:
     """Вызов Stability API для замены окон"""
-    url = "https://i.ytimg.com/vi/N913hReVxMM/maxresdefault.jpg"
+    url = "https://api.stability.ai/v2beta/stable-image/edit/inpaint"
     headers = {"Authorization": f"Bearer {STABILITY_API_KEY}", "Accept": "image/*"}
 
     form = aiohttp.FormData()
@@ -254,6 +254,10 @@ async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: st
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as sess:
         async with sess.post(url, headers=headers, data=form) as resp:
+            if resp.status == 413:
+                raise RuntimeError(
+                    "Stability API вернул 413 (слишком большой запрос). Попробуйте отправить изображение меньшего размера."
+                )
             if resp.status != 200:
                 txt = await resp.text()
                 raise RuntimeError(f"Ошибка Stability API: {resp.status} {txt}")
