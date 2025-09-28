@@ -41,9 +41,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("window_replacement_bot")
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=30)
+MAX_IMAGE_DIMENSION = 1600  # пиксели
+MAX_IMAGE_PAYLOAD = 5 * 1024 * 1024  # ~5 МБ
 LAST_IMAGE_URL: dict[int, str] = {}
 USER_SESSIONS: dict[int, dict] = {}
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+
+
+class StabilityAPIError(RuntimeError):
+    """Базовое исключение для ошибок Stability API."""
+
+
+class StabilityPayloadTooLarge(StabilityAPIError):
+    """Запрос отклонён из-за превышения ограничений размера."""
 
 # Категории окон
 WINDOW_CATEGORIES = {
@@ -252,14 +262,129 @@ async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: st
 
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as sess:
         async with sess.post(url, headers=headers, data=form) as resp:
+            if resp.status == 413:
+                txt = await resp.text()
+                raise StabilityPayloadTooLarge(f"Ошибка Stability API: 413 {txt}")
             if resp.status != 200:
                 txt = await resp.text()
-                raise RuntimeError(f"Ошибка Stability API: {resp.status} {txt}")
+                raise StabilityAPIError(f"Ошибка Stability API: {resp.status} {txt}")
             ctype = resp.headers.get("Content-Type", "")
             if "image/" not in ctype:
                 txt = await resp.text()
-                raise RuntimeError(f"Неожиданный content-type: {ctype} | тело: {txt[:400]}")
-            return await resp.read()
+                raise StabilityAPIError(f"Неожиданный content-type: {ctype} | тело: {txt[:400]}")
+        return await resp.read()
+
+
+def _resize_image_and_mask(
+    image: Image.Image,
+    mask: Image.Image,
+    scale: float,
+) -> tuple[Image.Image, Image.Image]:
+    """Вспомогательная функция для масштабирования изображения и маски."""
+
+    if scale >= 0.999:
+        return image, mask
+
+    new_size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+    resized_image = image.resize(new_size, Image.LANCZOS)
+    resized_mask = mask.resize(new_size, Image.NEAREST)
+    return resized_image, resized_mask
+
+
+def prepare_inpaint_payload(
+    image_path: str,
+    mask: Image.Image,
+    max_dimension: int = MAX_IMAGE_DIMENSION,
+    max_bytes: int = MAX_IMAGE_PAYLOAD,
+    min_dimension: int = 384,
+) -> tuple[bytes, bytes]:
+    """
+    Приводит изображение и маску к приемлемому размеру для Stability API.
+
+    API возвращает 413 при слишком больших payload'ах. Мы уменьшаем изображение и маску,
+    сохраняя пропорции, пока размер PNG не станет приемлемым.
+    """
+
+    with Image.open(image_path) as src:
+        image = src.convert("RGB")
+
+    mask = mask.convert("L")
+
+    # Ограничиваем максимальную сторону
+    longest_side = max(image.width, image.height)
+    if longest_side > max_dimension:
+        scale = max_dimension / float(longest_side)
+        image, mask = _resize_image_and_mask(image, mask, scale)
+
+    def encode(img: Image.Image, mk: Image.Image) -> tuple[bytes, bytes]:
+        img_buf = io.BytesIO()
+        img.save(img_buf, format="PNG", optimize=True)
+        mask_buf = io.BytesIO()
+        mk.save(mask_buf, format="PNG", optimize=True)
+        return img_buf.getvalue(), mask_buf.getvalue()
+
+    image_bytes, mask_bytes = encode(image, mask)
+
+    # Если все еще слишком большой payload, уменьшаем постепенно
+    while (
+        len(image_bytes) + len(mask_bytes) > max_bytes
+        and min(image.width, image.height) > min_dimension
+    ):
+        image, mask = _resize_image_and_mask(image, mask, 0.85)
+        image_bytes, mask_bytes = encode(image, mask)
+
+    return image_bytes, mask_bytes
+
+
+async def inpaint_with_adaptive_downscale(
+    image_path: str,
+    mask: Image.Image,
+    prompt: str,
+) -> bytes:
+    """Пытается вызвать Stability API, постепенно уменьшая payload при 413 ошибке."""
+
+    dimension_steps = [
+        MAX_IMAGE_DIMENSION,
+        1400,
+        1200,
+        1024,
+        896,
+        768,
+        640,
+        512,
+        448,
+        384,
+    ]
+
+    last_error: StabilityAPIError | None = None
+
+    for max_dim in dimension_steps:
+        max_dim = max(256, max_dim)
+        scale_ratio = max_dim / float(MAX_IMAGE_DIMENSION)
+        bytes_limit = max(2 * 1024 * 1024, int(MAX_IMAGE_PAYLOAD * min(1.0, scale_ratio * 1.1)))
+
+        image_bytes, mask_bytes = prepare_inpaint_payload(
+            image_path,
+            mask,
+            max_dimension=max_dim,
+            max_bytes=bytes_limit,
+            min_dimension=320,
+        )
+
+        try:
+            return await call_stability_inpaint(image_bytes, mask_bytes, prompt)
+        except StabilityPayloadTooLarge as err:
+            last_error = err
+            log.info(
+                "Stability API вернул 413: уменьшаем изображение (max_dim=%s, bytes_limit=%s)",
+                max_dim,
+                bytes_limit,
+            )
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise StabilityAPIError("Не удалось вызвать Stability API для замены окон")
 
 # ───────── перевод RU→EN ─────────
 async def translate_ru_to_en(text: str) -> tuple[str, str | None]:
@@ -455,25 +580,16 @@ async def handle_window_category(update: Update, context: ContextTypes.DEFAULT_T
     try:
         # Создаем маску для найденных окон
         mask = create_window_mask(session['image_path'], session['windows'])
-        
-        # Сохраняем маску
-        mask_buffer = io.BytesIO()
-        mask.save(mask_buffer, format='PNG')
-        mask_bytes = mask_buffer.getvalue()
-        
-        # Загружаем исходное изображение
-        with open(session['image_path'], 'rb') as f:
-            image_bytes = f.read()
-        
+
         # Переводим промпт
         prompt = category['prompt']
         translated_prompt, provider = await translate_ru_to_en(prompt)
         if provider and translated_prompt:
             prompt = translated_prompt
-        
-        # Вызываем Stability API
-        result_png = await call_stability_inpaint(image_bytes, mask_bytes, prompt)
-        
+
+        # Вызываем Stability API (при необходимости уменьшая payload)
+        result_png = await inpaint_with_adaptive_downscale(session['image_path'], mask, prompt)
+
         # Отправляем результат
         caption = f"✨ Готово! Окна заменены на {category['name'].lower()}\n\n"
         caption += f"📝 Категория: {category['description']}\n"
@@ -498,8 +614,18 @@ async def handle_window_category(update: Update, context: ContextTypes.DEFAULT_T
         except:
             pass
             
+    except StabilityPayloadTooLarge:
+        log.warning("Stability API отклонил запрос из-за размера payload даже после сжатия")
+        await query.edit_message_text(
+            "❌ Изображение слишком большое даже после сжатия. Попробуйте загрузить фото меньшего размера."
+        )
+    except StabilityAPIError as e:
+        log.error("Ошибка Stability API при замене окон: %s", e)
+        await query.edit_message_text(
+            "❌ Сервис обработки изображений вернул ошибку. Пожалуйста, попробуйте ещё раз позже."
+        )
     except Exception as e:
-        log.error(f"Ошибка при замене окон: {e}")
+        log.error("Неожиданная ошибка при замене окон: %s", e)
         await query.edit_message_text(f"❌ Ошибка при обработке: {str(e)}")
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
