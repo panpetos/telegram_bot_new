@@ -47,37 +47,94 @@ LAST_IMAGE_URL: dict[int, str] = {}
 USER_SESSIONS: dict[int, dict] = {}
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
 
-# Категории окон
+# Категории окон и остекления
 WINDOW_CATEGORIES = {
-    "standard": {
-        "name": "🏠 Стандартные окна",
-        "description": "Классические прямоугольные окна",
-        "prompt": "standard rectangular window with white frame"
+    "windows_white": {
+        "name": "Окна — белые",
+        "description": "Современные белые окна с аккуратными рамами",
+        "prompt": (
+            "replace only the existing windows with modern white pvc frames and clear glazing, "
+            "keep the building facade, walls, roof and surrounding details untouched"
+        ),
+        "group": "windows"
+    },
+    "windows_brown": {
+        "name": "Окна — коричневые",
+        "description": "Тёплые коричневые окна с натуральной текстурой",
+        "prompt": (
+            "replace only the existing windows with rich dark brown wooden-style frames and clear glazing, "
+            "preserve the house facade, walls, roof and every other architectural element"
+        ),
+        "group": "windows"
+    },
+    "frameless_clear": {
+        "name": "Безрамное остекление — прозрачное",
+        "description": "Панорамные сдвижные панели из прозрачного стекла",
+        "prompt": (
+            "install frameless sliding glass panels with transparent glazing only within the window openings, "
+            "keeping the rest of the building exterior unchanged"
+        ),
+        "group": "frameless"
+    },
+    "frameless_tinted": {
+        "name": "Безрамное остекление — тонированное",
+        "description": "Сдвижное безрамное остекление с деликатным тонированием",
+        "prompt": (
+            "install frameless sliding glass panels with lightly tinted glazing only inside the window areas, "
+            "maintaining the existing facade and architectural details"
+        ),
+        "group": "frameless"
     },
     "guillotine": {
-        "name": "🪟 Гильотинные окна", 
-        "description": "Окна с вертикальным подъемом",
-        "prompt": "guillotine sash window with vertical sliding mechanism"
+        "name": "Гильотинное вертикально-сдвижное остекление",
+        "description": "Вертикально поднимающиеся секции остекления",
+        "prompt": (
+            "transform the windows into elegant vertical guillotine glazing systems inside the openings only, "
+            "while keeping the building facade and surroundings exactly the same"
+        )
     },
-    "frameless": {
-        "name": "🔳 Безрамные окна",
-        "description": "Современные панорамные окна без видимых рам",
-        "prompt": "frameless panoramic window with minimal frame"
+    "pergola_tent": {
+        "name": "Перголы — тентовые",
+        "description": "Тентовые перголы с лёгким текстилем",
+        "prompt": (
+            "replace the windows with stylish retractable fabric pergola glazing inside the openings only, "
+            "without altering the house facade or walls"
+        ),
+        "group": "pergola"
     },
-    "arched": {
-        "name": "🏛️ Арочные окна",
-        "description": "Окна с арочным верхом",
-        "prompt": "arched window with curved top frame"
+    "pergola_bioclimatic": {
+        "name": "Перголы — биоклиматические",
+        "description": "Современные биоклиматические перголы",
+        "prompt": (
+            "add bioclimatic pergola style window systems with adjustable louvers inside the window zones only, "
+            "keeping the rest of the building intact"
+        ),
+        "group": "pergola"
     },
-    "bay": {
-        "name": "🏘️ Эркерные окна",
-        "description": "Выступающие многосекционные окна",
-        "prompt": "bay window with multiple sections protruding from wall"
+    "sunshade_beige": {
+        "name": "Солнцзащитные экраны — бежевые",
+        "description": "Лёгкие бежевые солнцезащитные полотна",
+        "prompt": (
+            "install beige sunshade screens within the window frames only, maintaining the facade, roof and walls unchanged"
+        ),
+        "group": "sunshade"
     },
-    "french": {
-        "name": "🇫🇷 Французские окна",
-        "description": "Высокие окна-двери до пола",
-        "prompt": "french window door extending to floor with glass panels"
+    "sunshade_brown": {
+        "name": "Солнцзащитные экраны — коричневые",
+        "description": "Плотные коричневые солнцезащитные панели",
+        "prompt": (
+            "install dark brown sunshade screens strictly inside the window openings, "
+            "leaving the rest of the building untouched"
+        ),
+        "group": "sunshade"
+    },
+    "mosquito_plisse": {
+        "name": "Москитные сетки-плиссе",
+        "description": "Компактные складные москитные системы",
+        "prompt": (
+            "add elegant plisse mosquito screen systems within the current window frames only, "
+            "preserving the entire house exterior without changes"
+        )
     }
 }
 
@@ -239,6 +296,64 @@ def create_window_mask(image_path: str, windows: List[Dict[str, Any]]) -> Image.
         log.error(f"Ошибка создания маски: {e}")
         # Возвращаем пустую маску
         return Image.new('L', (512, 512), 0)
+
+
+def sanitize_detected_windows(
+    image_path: str,
+    windows: List[Dict[str, Any]],
+    max_single_ratio: float = 0.3,
+    max_total_ratio: float = 0.45
+) -> List[Dict[str, Any]]:
+    """Отбрасывает подозрительные окна, чтобы не затронуть весь фасад дома."""
+
+    if not windows:
+        return []
+
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+    except Exception as exc:
+        log.error("Не удалось получить размеры изображения для фильтрации окон: %s", exc)
+        return []
+
+    img_area = max(1, width * height)
+
+    sanitized: List[Dict[str, Any]] = []
+
+    for window in windows:
+        bbox = window.get('bbox')
+        if not bbox or len(bbox) != 4:
+            continue
+
+        _, _, w, h = bbox
+        area = int(window.get('area') or (max(1, w) * max(1, h)))
+        ratio = area / img_area
+
+        if ratio > max_single_ratio:
+            log.info(
+                "Отфильтровано окно из-за слишком большого размера: ratio=%.2f bbox=%s",
+                ratio,
+                bbox
+            )
+            continue
+
+        sanitized.append({**window, 'area': area})
+
+    if not sanitized:
+        return []
+
+    sanitized.sort(key=lambda w: w.get('area', 0), reverse=True)
+    total_area = sum(w.get('area', 0) for w in sanitized)
+
+    while sanitized and (total_area / img_area) > max_total_ratio:
+        removed = sanitized.pop(0)
+        total_area -= removed.get('area', 0)
+        log.info(
+            "Удалено окно для ограничения общей площади маски: ratio=%.2f",
+            total_area / img_area if img_area else 0.0
+        )
+
+    return sanitized
 
 async def call_stability_inpaint(image_bytes: bytes, mask_png: bytes, prompt: str) -> bytes:
     """Вызов Stability API для замены окон"""
@@ -405,12 +520,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 4️⃣ Получите результат
 
 🪟 Доступные категории окон:
-• Стандартные окна
-• Гильотинные окна  
-• Безрамные окна
-• Арочные окна
-• Эркерные окна
-• Французские окна
+• Окна — белые
+• Окна — коричневые
+• Безрамное остекление — прозрачное
+• Безрамное остекление — тонированное
+• Гильотинное вертикально-сдвижное остекление
+• Перголы — тентовые
+• Перголы — биоклиматические
+• Солнцзащитные экраны — бежевые
+• Солнцзащитные экраны — коричневые
+• Москитные сетки-плиссе
 
 💡 Советы:
 • Используйте четкие фото фасадов зданий
@@ -425,13 +544,17 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def create_window_categories_keyboard():
     """Создает клавиатуру с категориями окон"""
-    keyboard = []
+    keyboard: List[List[InlineKeyboardButton]] = []
+    grouped: Dict[str, List[Tuple[str, dict]]] = {}
+
     for key, category in WINDOW_CATEGORIES.items():
-        keyboard.append([InlineKeyboardButton(
-            category["name"], 
-            callback_data=f"window_category:{key}"
-        )])
-    
+        group_key = category.get("group", key)
+        grouped.setdefault(group_key, []).append((key, category))
+
+    for items in grouped.values():
+        row = [InlineKeyboardButton(category["name"], callback_data=f"window_category:{key}") for key, category in items]
+        keyboard.append(row)
+
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -455,12 +578,22 @@ async def got_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LAST_IMAGE_URL[user_id] = public_url
         
         # Детектируем окна
-        windows = window_detector.detect_windows(local_path)
-        
+        detected_windows = window_detector.detect_windows(local_path)
+        windows = sanitize_detected_windows(local_path, detected_windows)
+
+        if detected_windows and len(windows) < len(detected_windows):
+            log.info(
+                "Фильтрация окон сократила количество областей: было %d, осталось %d",
+                len(detected_windows),
+                len(windows)
+            )
+
         if not windows:
-            await loading_msg.edit_text("❌ На изображении не найдено окон. Попробуйте загрузить фото фасада здания с четко видимыми окнами.")
+            await loading_msg.edit_text(
+                "❌ Не удалось надежно выделить окна на фото. Попробуйте загрузить более чёткое изображение фасада, чтобы дом оставался без изменений."
+            )
             return
-        
+
         # Сохраняем информацию о сессии пользователя
         USER_SESSIONS[user_id] = {
             'image_path': local_path,
