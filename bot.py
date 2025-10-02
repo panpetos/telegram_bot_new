@@ -555,6 +555,7 @@ def create_window_categories_keyboard():
         row = [InlineKeyboardButton(category["name"], callback_data=f"window_category:{key}") for key, category in items]
         keyboard.append(row)
 
+    keyboard.append([InlineKeyboardButton("🟢 Проверить связь с ботом", callback_data="ping_check")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -625,7 +626,11 @@ async def handle_window_category(update: Update, context: ContextTypes.DEFAULT_T
     if query.data == "cancel":
         await query.edit_message_text("❌ Операция отменена.")
         return
-    
+
+    if query.data == "ping_check":
+        await query.answer("🟢 Бот работает нормально!", show_alert=True)
+        return
+
     if not query.data.startswith("window_category:"):
         return
     
